@@ -1,0 +1,580 @@
+version: '3.8'
+
+# ---------- VARIÁVEIS COMUNS ----------
+x-common-env: &common-env
+  # Redis configuração com Sentinel
+  REDIS_SENTINEL_HOST: sentinel1,sentinel2,sentinel3
+  REDIS_SENTINEL_PORT: 26379
+  REDIS_MASTER_NAME: mymaster
+  # Configurações antigas do Redis mantidas para compatibilidade
+  REDIS_HOST: redis-master
+  REDIS_PORT: 6379
+  # RabbitMQ configuração com cluster
+  MQ_HOSTS: rabbitmq1:5672,rabbitmq2:5672,rabbitmq3:5672
+  MQ_HOST: rabbitmq1
+  MQ_PORT: 5672
+  # Outras configurações
+  STORAGE_BACKEND: cockroach
+  # Usando SSL disable para simplificar o desenvolvimento
+  COCKROACH_DSN: postgresql://root@cockroach-lb-nginx:26257/kvdb?sslmode=disable
+  # Configurações de limite para o Redis
+  MAX_CACHE_KEYS: 10000  # Limite de 10.000 chaves
+  MAX_CACHE_MEMORY_MB: 100  # Limite de 100MB de memória
+
+services:
+  # ---------- DATA LAYER ----------
+  cockroach1:
+    image: cockroachdb/cockroach:v23.2.4
+    container_name: cockroach1
+    command: >
+      start --insecure
+      --advertise-addr=cockroach1:26257
+      --listen-addr=0.0.0.0:26257
+      --http-addr=0.0.0.0:8080
+      --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+      --locality=node=1
+    hostname: cockroach1
+    volumes:
+      - cockroach-data1:/cockroach/cockroach-data
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  cockroach2:
+    image: cockroachdb/cockroach:v23.2.4
+    container_name: cockroach2
+    command: >
+      start --insecure
+      --advertise-addr=cockroach2:26257
+      --listen-addr=0.0.0.0:26257
+      --http-addr=0.0.0.0:8080
+      --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+      --locality=node=2
+    hostname: cockroach2
+    volumes:
+      - cockroach-data2:/cockroach/cockroach-data
+    restart: unless-stopped
+    depends_on:
+      cockroach1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  cockroach3:
+    image: cockroachdb/cockroach:v23.2.4
+    container_name: cockroach3
+    command: >
+      start --insecure
+      --advertise-addr=cockroach3:26257
+      --listen-addr=0.0.0.0:26257
+      --http-addr=0.0.0.0:8080
+      --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+      --locality=node=3
+    hostname: cockroach3
+    volumes:
+      - cockroach-data3:/cockroach/cockroach-data
+    restart: unless-stopped
+    depends_on:
+      cockroach1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Load balancer para o CockroachDB
+  cockroach-lb-nginx:
+    image: nginx:1.27-alpine
+    container_name: cockroach-lb
+    volumes:
+      - ./nginx/cockroach-lb.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      cockroach1:
+        condition: service_healthy
+      cockroach2:
+        condition: service_healthy
+      cockroach3:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "26258:26257"
+
+  cockroach-init:
+    image: cockroachdb/cockroach:v23.2.4
+    container_name: cockroach-initializer
+    depends_on:
+      cockroach1:
+        condition: service_healthy
+      cockroach2:
+        condition: service_healthy
+      cockroach3:
+        condition: service_healthy
+    entrypoint: >
+      sh -c '
+        echo "⏳ Waiting for CockroachDB nodes to be ready..."
+        sleep 15
+        
+        # Check each node explicitly with explicit node names
+        echo "Testing connection to cockroach1"
+        if curl -s http://cockroach1:8080/health; then
+          echo "✅ cockroach1 HTTP health check passed"
+        else
+          echo "❌ cockroach1 HTTP health check failed"
+        fi
+        
+        echo "Testing connection to cockroach2"
+        if curl -s http://cockroach2:8080/health; then
+          echo "✅ cockroach2 HTTP health check passed"
+        else
+          echo "❌ cockroach2 HTTP health check failed"
+        fi
+        
+        echo "Testing connection to cockroach3"
+        if curl -s http://cockroach3:8080/health; then
+          echo "✅ cockroach3 HTTP health check passed"
+        else
+          echo "❌ cockroach3 HTTP health check failed"
+        fi
+        
+        # Simplified connection check with better error output
+        echo "Trying direct SQL connection to cockroach1..."
+        if cockroach sql --host=cockroach1 --insecure -e "SELECT 1;" > /dev/null 2>&1; then
+          echo "✅ SQL connection successful"
+        else
+          echo "❌ SQL connection failed - will retry initialization anyway"
+        fi
+        
+        # Show debug info
+        echo "Network debug info:"
+        cockroach node status --host=cockroach1 --insecure || echo "Cannot get node status yet"
+        
+        # Proceed with initialization
+        echo "Initializing cluster..."
+        cockroach init --host=cockroach1 --insecure || echo "Init failed (may already be initialized)"
+        
+        echo "Creating database and tables..."
+        cockroach sql --host=cockroach1 --insecure -e "CREATE DATABASE IF NOT EXISTS kvdb;" || echo "Failed to create database"
+        cockroach sql --host=cockroach1 --insecure -e "CREATE TABLE IF NOT EXISTS kvdb.kv_store (key STRING PRIMARY KEY, value STRING);" || echo "Failed to create table"
+        
+        # Final verification
+        echo "Final database verification:"
+        cockroach sql --host=cockroach1 --insecure -e "SHOW DATABASES;"
+        echo "Node status:"
+        cockroach node status --host=cockroach1 --insecure
+      '
+    restart: "no"
+
+  # Redis Cluster (1 master, 2 slaves, 3 sentinels)
+  redis-master:
+    image: redis:7
+    container_name: redis-master
+    command: redis-server --maxmemory ${MAX_CACHE_MEMORY_MB:-100}mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-master-data:/data
+    restart: unless-stopped
+    environment:
+      MAXMEMORY: "${MAX_CACHE_MEMORY_MB:-100}mb"
+      MAXMEMORY_POLICY: "allkeys-lru"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  redis-slave1:
+    image: redis:7
+    container_name: redis-slave1
+    command: redis-server --slaveof redis-master 6379 --maxmemory ${MAX_CACHE_MEMORY_MB:-100}mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-slave1-data:/data
+    depends_on:
+      - redis-master
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  redis-slave2:
+    image: redis:7
+    container_name: redis-slave2
+    command: redis-server --slaveof redis-master 6379 --maxmemory ${MAX_CACHE_MEMORY_MB:-100}mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-slave2-data:/data
+    depends_on:
+      - redis-master
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  sentinel1:
+    image: redis:7
+    container_name: sentinel1
+    command: >
+      sh -c '
+        mkdir -p /etc/redis &&
+        echo "port 26379
+        sentinel monitor mymaster redis-master 6379 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 60000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes" > /etc/redis/sentinel.conf &&
+        redis-sentinel /etc/redis/sentinel.conf
+      '
+    depends_on:
+      - redis-master
+      - redis-slave1
+      - redis-slave2
+    restart: unless-stopped
+
+  sentinel2:
+    image: redis:7
+    container_name: sentinel2
+    command: >
+      sh -c '
+        mkdir -p /etc/redis &&
+        echo "port 26379
+        sentinel monitor mymaster redis-master 6379 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 60000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes" > /etc/redis/sentinel.conf &&
+        redis-sentinel /etc/redis/sentinel.conf
+      '
+    depends_on:
+      - redis-master
+      - redis-slave1
+      - redis-slave2
+    restart: unless-stopped
+
+  sentinel3:
+    image: redis:7
+    container_name: sentinel3
+    command: >
+      sh -c '
+        mkdir -p /etc/redis &&
+        echo "port 26379
+        sentinel monitor mymaster redis-master 6379 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 60000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes" > /etc/redis/sentinel.conf &&
+        redis-sentinel /etc/redis/sentinel.conf
+      '
+    depends_on:
+      - redis-master
+      - redis-slave1
+      - redis-slave2
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq1
+    hostname: rabbitmq1
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+      RABBITMQ_ERLANG_COOKIE: RABBITMQ_SECRET_COOKIE
+    ports:
+      - "25672:5672"  # Porta alta para evitar restrições de acesso
+      - "25673:15672" # Porta alta para interface web
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - default
+      - rabbitmq_cluster
+
+  rabbitmq2:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq2
+    hostname: rabbitmq2
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+      RABBITMQ_ERLANG_COOKIE: RABBITMQ_SECRET_COOKIE
+    ports:
+      - "25674:5672"
+      - "25675:15672"
+    command: >
+      bash -c "
+        # Wait for rabbitmq1 to be fully ready
+        echo 'Waiting for cluster to be ready...'
+        sleep 20;
+        
+        # Start RabbitMQ server in detached mode
+        echo 'Starting RabbitMQ server...'
+        rabbitmq-server -detached;
+        sleep 15;
+        
+        # Try to join the cluster
+        echo 'Joining cluster...'
+        rabbitmqctl stop_app;
+        rabbitmqctl reset;
+        rabbitmqctl join_cluster rabbit@rabbitmq1;
+        rabbitmqctl start_app;
+        
+        # Check cluster status
+        echo 'Checking cluster status...'
+        rabbitmqctl cluster_status;
+        
+        # Keep container running
+        tail -f /dev/null
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    networks:
+      - default
+      - rabbitmq_cluster
+
+  rabbitmq3:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq3
+    hostname: rabbitmq3
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      rabbitmq2:
+        condition: service_started
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+      RABBITMQ_ERLANG_COOKIE: RABBITMQ_SECRET_COOKIE
+    ports:
+      - "25676:5672"
+      - "25677:15672"
+    command: >
+      bash -c "
+        # Wait for rabbitmq1 to be fully ready
+        echo 'Waiting for cluster to be ready...'
+        sleep 30;
+        
+        # Start RabbitMQ server in detached mode
+        echo 'Starting RabbitMQ server...'
+        rabbitmq-server -detached;
+        sleep 15;
+        
+        # Try to join the cluster
+        echo 'Joining cluster...'
+        rabbitmqctl stop_app;
+        rabbitmqctl reset;
+        rabbitmqctl join_cluster rabbit@rabbitmq1;
+        rabbitmqctl start_app;
+        
+        # Check cluster status
+        echo 'Checking cluster status...'
+        rabbitmqctl cluster_status;
+        
+        # Keep container running
+        tail -f /dev/null
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - default
+      - rabbitmq_cluster
+
+  # ---------- APPLICATION LAYER ----------
+  api:
+    build: .
+    container_name: api
+    depends_on:
+      cockroach-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-${HOSTNAME:-unknown}
+      SERVICE_PORT: 8000
+    restart: unless-stopped
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api2:
+    build: .
+    container_name: api2
+    depends_on:
+      cockroach-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-${HOSTNAME:-unknown}
+      SERVICE_PORT: 8000
+    restart: unless-stopped
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api3:
+    build: .
+    container_name: api3
+    depends_on:
+      cockroach-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-${HOSTNAME:-unknown}
+      SERVICE_PORT: 8000
+    restart: unless-stopped
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  consumer1:
+    build: ./consumer
+    container_name: consumer1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      cockroach-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      METRICS_PORT: "9092"
+      HEALTH_PORT: "8080"
+      SERVICE_NAME: consumer-${HOSTNAME:-unknown}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  consumer2:
+    build: ./consumer
+    container_name: consumer2
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      cockroach-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      METRICS_PORT: "9092"
+      HEALTH_PORT: "8080"
+      SERVICE_NAME: consumer-${HOSTNAME:-unknown}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  consumer3:
+    build: ./consumer
+    container_name: consumer3
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      cockroach-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      METRICS_PORT: "9092"
+      HEALTH_PORT: "8080"
+      SERVICE_NAME: consumer-${HOSTNAME:-unknown}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------- EDGE ----------
+  api-lb-nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx-lb
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["80:80"]
+    depends_on:
+      - api
+      - api2
+      - api3
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  cockroach-data1:
+  cockroach-data2:
+  cockroach-data3:
+  redis-master-data:
+  redis-slave1-data:
+  redis-slave2-data:
+
+networks:
+  default:
+  rabbitmq_cluster:
+    driver: bridge
